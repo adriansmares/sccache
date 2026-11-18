@@ -434,6 +434,60 @@ fn test_msvc_deps(compiler: Compiler, tempdir: &Path) {
     assert_ne!(includes.len(), 0);
 }
 
+/// A hit has to leave behind the dependency file of the directory it happens
+/// in. With the preprocessor cache it comes out of the entry, as the
+/// preprocessor that otherwise writes it does not run.
+fn test_msvc_deps_cache_hit(compiler: Compiler, tempdir: &Path, preprocessor_cache_mode: bool) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    zero_stats();
+
+    for dir_name in ["deps_a", "deps_b"] {
+        let dir = tempdir.join(dir_name);
+        fs::create_dir_all(&dir).unwrap();
+        write_source(
+            &dir,
+            "deps.c",
+            "#include <stdio.h>\nvoid deps(void) { puts(\"deps\"); }\n",
+        );
+        // The preprocessor cache leaves out files that are too recent.
+        let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(10));
+        filetime::set_file_times(dir.join("deps.c"), old, old).unwrap();
+
+        let mut args = compile_cmdline(name, &exe, "deps.c", "deps.obj", Vec::new());
+        args.push("/sourceDependenciesdeps.json".into());
+        for _ in 0..2 {
+            sccache_command()
+                .args(&args)
+                .current_dir(&dir)
+                .envs(env_vars.clone())
+                .assert()
+                .success();
+            let deps_file = dir.join("deps.json");
+            let deps: serde_json::Value =
+                serde_json::from_reader(File::open(&deps_file).expect("No dep file")).unwrap();
+            let source = deps["Data"]["Source"].as_str().expect("No source found");
+            assert!(source.to_lowercase().contains(dir_name), "{source}");
+            let includes = deps["Data"]["Includes"]
+                .as_array()
+                .expect("No includes found");
+            assert_ne!(includes.len(), 0);
+            fs::remove_file(&deps_file).unwrap();
+        }
+    }
+
+    get_stats(move |info| {
+        // The dependency file names its directory, so an entry that carries
+        // it is not shared with the other one.
+        let hits = if preprocessor_cache_mode { 2 } else { 3 };
+        assert_eq!(hits, info.stats.cache_hits.all());
+        assert_eq!(4 - hits, info.stats.cache_misses.all());
+    });
+}
+
 fn test_msvc_responsefile(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name: _,
@@ -816,6 +870,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
     test_compile_with_define(compiler.clone(), tempdir);
     if compiler.name == "cl.exe" {
         test_msvc_deps(compiler.clone(), tempdir);
+        test_msvc_deps_cache_hit(compiler.clone(), tempdir, preprocessor_cache_mode);
         test_msvc_responsefile(compiler.clone(), tempdir);
         test_msvc_show_includes_cache_hit(compiler.clone(), tempdir, preprocessor_cache_mode);
     }

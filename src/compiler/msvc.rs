@@ -121,6 +121,12 @@ impl CCompilerImpl for Msvc {
         replace_show_includes(&stdout, preprocessor_stderr, &self.includes_prefix)
     }
 
+    fn outputs_name_cwd(&self, parsed_args: &ParsedArguments) -> bool {
+        // cl.exe writes the source and its includes to the dependency file
+        // by absolute path.
+        parsed_args.outputs.contains_key("d")
+    }
+
     fn generate_compile_commands<T>(
         &self,
         path_transformer: &mut dist::PathTransformer,
@@ -659,6 +665,13 @@ fn without_cl_env_vars(env_vars: &[(OsString, OsString)]) -> Vec<(OsString, OsSt
         .collect()
 }
 
+/// Whether cl.exe writes its `/sourceDependencies` output to `path` itself. It
+/// also takes a directory, and `-` for the standard output.
+fn is_dependency_file(path: &Path, cwd: &Path) -> bool {
+    let name = path.as_os_str().to_string_lossy();
+    name != "-" && !name.ends_with(['\\', '/']) && !cwd.join(path).is_dir()
+}
+
 pub fn parse_arguments(
     arguments: &[OsString],
     cwd: &Path,
@@ -678,6 +691,7 @@ pub fn parse_arguments(
     let mut debug_info = false;
     let mut pdb = None;
     let mut depfile = None;
+    let mut depfile_arg = None;
     let mut too_hard_for_preprocessor_cache_mode = None;
     let mut show_includes = false;
     let mut xclangs: Vec<OsString> = vec![];
@@ -721,8 +735,7 @@ pub fn parse_arguments(
             }
             Some(DepFile(p)) => {
                 depfile = Some(p.clone());
-                // The preprocessor writes the dependency file, and a preprocessor cache hit skips it.
-                too_hard_for_preprocessor_cache_mode = Some(arg.to_os_string());
+                depfile_arg = Some(arg.to_os_string());
             }
             Some(ProgramDatabase(p)) => pdb = Some(p.clone()),
             Some(DebugInfo) => debug_info = true,
@@ -1002,6 +1015,21 @@ pub fn parse_arguments(
                 optional: false,
             },
         );
+    }
+    if let Some(path) = &depfile {
+        if !is_clang && is_dependency_file(path, cwd) {
+            // Kept with the object: a preprocessor cache hit skips the
+            // preprocessor, which otherwise writes it on every compilation.
+            outputs.insert(
+                "d",
+                ArtifactDescriptor {
+                    path: path.clone(),
+                    optional: true,
+                },
+            );
+        } else {
+            too_hard_for_preprocessor_cache_mode = depfile_arg;
+        }
     }
     if language == Language::Cxx
         && let Some(obj) = outputs.get("obj")
@@ -1351,6 +1379,14 @@ fn generate_compile_commands(
     let mut arguments: Vec<OsString> = vec![parsed_args.compilation_flag.clone(), fo];
     arguments.extend_from_slice(&parsed_args.preprocessor_args);
     arguments.extend_from_slice(&parsed_args.dependency_args);
+    // After a preprocessor cache hit whose object is gone, the compiler runs
+    // without the preprocessor having written the dependency file.
+    if let Some(depfile) = &parsed_args.depfile
+        && parsed_args.outputs.contains_key("d")
+    {
+        arguments.push("/sourceDependencies".into());
+        arguments.push(depfile.into());
+    }
     arguments.extend_from_slice(&parsed_args.unhashed_args);
     arguments.extend_from_slice(&parsed_args.common_args);
     if parsed_args.double_dash_input {
@@ -2165,7 +2201,7 @@ mod test {
             assert_eq!(Some("foo.c"), input.to_str());
             assert_eq!(Language::C, language);
             assert_eq!(Some(PathBuf::from_str("foo.obj.json").unwrap()), depfile);
-            assert!(too_hard_for_preprocessor_cache_mode.is_some());
+            assert!(too_hard_for_preprocessor_cache_mode.is_none());
             assert_map_contains!(
                 outputs,
                 (
@@ -2174,12 +2210,94 @@ mod test {
                         path: PathBuf::from("foo.obj"),
                         optional: false
                     }
+                ),
+                (
+                    "d",
+                    ArtifactDescriptor {
+                        path: PathBuf::from("foo.obj.json"),
+                        optional: true
+                    }
                 )
             );
             assert!(preprocessor_args.is_empty());
             assert!(common_args.is_empty());
             assert!(!msvc_show_includes);
         }
+    }
+
+    #[test]
+    fn parse_deps_arguments_written_by_preprocessor_only() {
+        // clang-cl leaves the file to sccache, and cl.exe does not write these
+        // two to the path it is given.
+        let parsed = [
+            parse_arguments_clang(ovec!["-c", "foo.c", "/Fofoo.obj", "/depsfoo.obj.json"]),
+            parse_arguments(ovec![
+                "-c",
+                "foo.c",
+                "/Fofoo.obj",
+                "/sourceDependencies",
+                "-"
+            ]),
+            parse_arguments(ovec![
+                "-c",
+                "foo.c",
+                "/Fofoo.obj",
+                "/sourceDependencies",
+                "deps/"
+            ]),
+        ];
+
+        for parsed in parsed {
+            let ParsedArguments {
+                outputs,
+                depfile,
+                too_hard_for_preprocessor_cache_mode,
+                ..
+            } = match parsed {
+                CompilerArguments::Ok(args) => args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            assert!(depfile.is_some());
+            assert!(too_hard_for_preprocessor_cache_mode.is_some());
+            assert!(!outputs.contains_key("d"));
+        }
+    }
+
+    #[test]
+    fn test_compile_writes_cached_depfile() {
+        let f = TestFixture::new();
+        let compile_args = |parsed: CompilerArguments<ParsedArguments>| {
+            let parsed_args = match parsed {
+                CompilerArguments::Ok(args) => args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut path_transformer = dist::PathTransformer::new();
+            let (command, _, _) = generate_compile_commands(
+                &mut path_transformer,
+                &f.bins[0],
+                &parsed_args,
+                f.tempdir.path(),
+                &[],
+            )
+            .unwrap();
+            command.arguments
+        };
+        let args = ovec!["-c", "foo.c", "-Fofoo.obj", "/depsfoo.obj.json"];
+
+        assert_eq!(
+            compile_args(parse_arguments(args.clone())),
+            ovec![
+                "-c",
+                "-Fofoo.obj",
+                "/sourceDependencies",
+                "foo.obj.json",
+                "foo.c"
+            ]
+        );
+        assert_eq!(
+            compile_args(parse_arguments_clang(args)),
+            ovec!["-c", "-Fofoo.obj", "foo.c"]
+        );
     }
 
     #[test]

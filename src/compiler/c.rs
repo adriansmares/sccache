@@ -215,6 +215,11 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
     ) -> Vec<u8> {
         stdout
     }
+    /// Return true iff an output names the working directory, so that an
+    /// entry made in one directory is wrong when restored in another.
+    fn outputs_name_cwd(&self, _parsed_args: &ParsedArguments) -> bool {
+        false
+    }
     /// Determine whether `arguments` are supported by this compiler.
     fn parse_arguments(
         &self,
@@ -416,7 +421,7 @@ where
     ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
 
-        let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
+        let mut extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.
         let assembler_digest = if self.parsed_args.uses_external_assembler {
@@ -487,6 +492,14 @@ where
             );
             false
         };
+
+        // A preprocessor cache hit restores every output from the entry, and
+        // neither key otherwise tells two working directories apart.
+        if use_preprocessor_cache_mode && self.compiler.outputs_name_cwd(&self.parsed_args) {
+            let mut m = Digest::new();
+            m.update(cwd.as_os_str().as_encoded_bytes());
+            extra_hashes.push(m.finish());
+        }
 
         let mut preprocessor_key = if use_preprocessor_cache_mode {
             preprocessor_cache_entry_hash_key(
